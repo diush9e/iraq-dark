@@ -1,0 +1,30 @@
+{
+  "name": "iraq-dark",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "api": "node server/server.cjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server/start.cjs",
+    "db:init": "node server/init-db.cjs",
+    "db:upgrade": "node server/upgrade-db.cjs"
+  },
+  "devDependencies": {
+    "vite": "^8.3.0"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "better-sqlite3": "^13.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@13.0.3": true,
+    "bcrypt@6.0.0": true
+  }
+}
