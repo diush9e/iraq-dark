@@ -107,6 +107,238 @@ async function api(path, options = {}) {
   return data
 }
 
+/* --------------------------------------------------------------------------
+   Media — uploads, avatars, attachments
+   -------------------------------------------------------------------------- */
+
+const MAX_MEDIA_PER_TOPIC = 4
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+const ACCEPTED_UPLOADS = [
+  'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif',
+  'video/mp4', 'video/webm', 'video/quicktime'
+].join(',')
+
+let attachId = 0
+
+/** POST raw bytes to /api/media and resolve with { url, kind, bytes }. */
+async function uploadFile(file, purpose = 'topic') {
+  if (file.size > MAX_UPLOAD_BYTES) {
+    throw new Error('الملف أكبر من الحد المسموح (20MB)')
+  }
+
+  const response = await fetch(`/api/media?purpose=${purpose}`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    body: file
+  })
+
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new Error(data.error || 'تعذّر رفع الملف')
+  }
+
+  return data
+}
+
+/**
+ * Workers KV is eventually consistent: a file uploaded seconds ago may 404 for
+ * a short window while the value propagates. Retry with a cache-busting query
+ * string until it shows up, then fall back to a visible placeholder.
+ */
+const MEDIA_RETRY_DELAYS = [2000, 5000, 10000, 20000, 30000]
+
+function withMediaRetry(node, url) {
+  let attempt = 0
+
+  node.addEventListener('error', () => {
+    if (attempt >= MEDIA_RETRY_DELAYS.length) {
+      node.replaceWith(el('div', { class: 'media-item media-missing', text: 'تعذّر تحميل الملف' }))
+      return
+    }
+
+    const wait = MEDIA_RETRY_DELAYS[attempt]
+    attempt += 1
+
+    setTimeout(() => {
+      const join = url.includes('?') ? '&' : '?'
+      node.src = `${url}${join}r=${attempt}`
+    }, wait)
+  })
+
+  return node
+}
+
+/** Avatar image when one was uploaded, otherwise the initial letter. */
+function avatarNode(user, size = '') {
+  const classes = ['avatar', size, user?.avatar_url ? 'img' : '']
+    .filter(Boolean)
+    .join(' ')
+  const label = String(user?.username || user?.name || '?')
+
+  if (user?.avatar_url) {
+    return withMediaRetry(el('img', {
+      class: classes,
+      src: user.avatar_url,
+      alt: label,
+      loading: 'lazy',
+      decoding: 'async'
+    }), user.avatar_url)
+  }
+
+  return el('span', { class: classes, text: label.slice(0, 1).toUpperCase() })
+}
+
+/** Renders an attachment list: real players in full view, silent previews in cards. */
+function mediaGallery(items, { compact = false } = {}) {
+  if (!Array.isArray(items) || !items.length) return null
+
+  const nodes = items.map(item => {
+    if (item.kind === 'video') {
+      const video = compact
+        ? el('video', {
+            class: 'media-item video',
+            src: item.url,
+            preload: 'metadata',
+            muted: true,
+            playsinline: true,
+            'aria-hidden': 'true'
+          })
+        : el('video', {
+            class: 'media-item video',
+            src: item.url,
+            controls: true,
+            playsinline: true,
+            preload: 'metadata'
+          })
+
+      return withMediaRetry(video, item.url)
+    }
+
+    return withMediaRetry(el('img', {
+      class: 'media-item image',
+      src: item.url,
+      alt: 'مرفق منشور',
+      loading: 'lazy',
+      decoding: 'async'
+    }), item.url)
+  })
+
+  return el('div', {
+    class: `media-grid${compact ? ' compact' : ''} media-${Math.min(items.length, 4)}`
+  }, nodes)
+}
+
+/**
+ * File picker + thumbnails for the topic form.
+ * `collect()` uploads everything new and resolves to `[{ url, kind }]`.
+ */
+function attachField(existing = []) {
+  const inputId = `attach-file-${attachId++}`
+  const items = existing.map(item => ({ ...item, file: null, objectUrl: null }))
+
+  const preview = el('div', { class: 'attach-grid' })
+
+  function clearPreviews() {
+    for (const item of items) {
+      if (item.objectUrl) URL.revokeObjectURL(item.objectUrl)
+    }
+  }
+
+  function render() {
+    preview.replaceChildren(...items.map((item, index) => {
+      const thumb = item.kind === 'video'
+        ? el('video', {
+            class: 'attach-thumb',
+            src: item.url,
+            preload: 'metadata',
+            muted: true,
+            playsinline: true
+          })
+        : el('img', { class: 'attach-thumb', src: item.url, alt: '' })
+
+      return el('div', { class: 'attach-item' }, [
+        thumb,
+        item.file ? el('span', { class: 'attach-badge', text: 'جديد' }) : null,
+        el('button', {
+          class: 'attach-remove',
+          type: 'button',
+          'aria-label': 'إزالة المرفق',
+          onclick: () => {
+            if (item.objectUrl) URL.revokeObjectURL(item.objectUrl)
+            items.splice(index, 1)
+            render()
+          }
+        }, [icon('close', 14)])
+      ].filter(Boolean))
+    }))
+  }
+
+  const input = el('input', {
+    id: inputId,
+    type: 'file',
+    class: 'attach-input',
+    accept: ACCEPTED_UPLOADS,
+    multiple: true,
+    onchange: event => {
+      for (const file of [...(event.target.files || [])]) {
+        if (items.length >= MAX_MEDIA_PER_TOPIC) {
+          toast(`الحد الأقصى ${MAX_MEDIA_PER_TOPIC} مرفقات`, 'error')
+          break
+        }
+        if (file.size > MAX_UPLOAD_BYTES) {
+          toast('الملف أكبر من 20MB', 'error')
+          continue
+        }
+
+        const objectUrl = URL.createObjectURL(file)
+
+        items.push({
+          file,
+          kind: file.type.startsWith('video/') ? 'video' : 'image',
+          url: objectUrl,
+          objectUrl
+        })
+      }
+
+      event.target.value = ''
+      render()
+    }
+  })
+
+  render()
+
+  return {
+    node: el('div', { class: 'field' }, [
+      el('span', { text: 'صور / فيديو' }),
+      input,
+      el('label', { class: 'button ghost attach-pick', for: inputId }, [
+        icon('plus', 16),
+        el('span', { text: 'أضف مرفقاً' })
+      ]),
+      preview,
+      el('p', { class: 'muted attach-hint', text: `حتى ${MAX_MEDIA_PER_TOPIC} مرفقات — صور أو فيديو بحد أقصى 20MB` })
+    ]),
+    clearPreviews,
+    hasFiles: () => items.some(item => Boolean(item.file)),
+    async collect() {
+      const out = []
+
+      for (const item of items) {
+        if (item.file) {
+          const stored = await uploadFile(item.file, 'topic')
+          out.push({ url: stored.url, kind: stored.kind })
+        } else {
+          out.push({ url: item.url, kind: item.kind })
+        }
+      }
+
+      return out
+    }
+  }
+}
+
 function toast(message, type = 'info') {
   let host = document.querySelector('#toasts')
 
@@ -133,6 +365,13 @@ function loadingView(text = 'جارٍ التحميل…') {
     el('div', { class: 'spinner' }),
     el('p', { class: 'muted', text })
   ])
+}
+
+/** Re-read the signed-in user (used after avatar / username changes). */
+async function refreshMe() {
+  const me = await api('/api/auth/me').catch(() => ({ user: null }))
+  state.user = me.user
+  return state.user
 }
 
 /* --------------------------------------------------------------------------
@@ -274,7 +513,7 @@ function renderHeader(route) {
           class: `nav-btn account${current === 'profile' ? ' active' : ''}`,
           href: '#/profile'
         }, [
-          el('span', { class: 'avatar mini', text: state.user.username.slice(0, 1).toUpperCase() }),
+          avatarNode(state.user, 'mini'),
           el('span', { text: state.user.username })
         ]),
         el('a', { class: 'nav-btn danger', href: '#/logout', onclick: event => {
@@ -370,8 +609,13 @@ function topicCard(topic) {
     ]),
     el('h3', { text: topic.title }),
     el('p', { class: 'topic-excerpt', text: topic.excerpt || '' }),
+    mediaGallery(topic.media, { compact: true }),
     el('div', { class: 'topic-card-foot' }, [
-      el('span', { class: 'meta author' }, [icon('user', 14), el('span', { text: topic.username })]),
+      el('span', { class: 'meta author' }, [
+        avatarNode(topic, 'mini'),
+        icon('user', 14),
+        el('span', { text: topic.username })
+      ]),
       el('span', { class: 'meta' }, [icon('comment', 14), el('span', { text: String(topic.reply_count ?? 0) })]),
       el('span', { class: 'meta' }, [icon('heart', 14), el('span', { text: String(topic.like_count ?? 0) })]),
       el('span', { class: 'meta' }, [icon('eye', 14), el('span', { text: String(topic.view_count ?? 0) })])
@@ -670,7 +914,7 @@ async function viewTopic(id) {
 
   const authorRow = el('div', { class: 'author-row' }, [
     el('a', { class: 'author', href: `#/user/${topic.author_id}` }, [
-      el('span', { class: 'avatar', text: topic.username.slice(0, 1).toUpperCase() }),
+      avatarNode(topic),
       el('div', {}, [
         el('strong', { text: topic.username }),
         el('small', { text: formatDate(topic.created_at) })
@@ -729,7 +973,7 @@ async function viewTopic(id) {
     return el('article', { class: 'reply' }, [
       el('div', { class: 'reply-head' }, [
         el('a', { class: 'author', href: `#/user/${reply.author_id}` }, [
-          el('span', { class: 'avatar mini', text: reply.username.slice(0, 1).toUpperCase() }),
+          avatarNode(reply, 'mini'),
           el('strong', { text: reply.username })
         ]),
         el('span', { class: 'meta', text: timeAgo(reply.created_at) })
@@ -794,7 +1038,10 @@ async function viewTopic(id) {
     meta,
     el('h1', { class: 'topic-title', text: topic.title }),
     authorRow,
-    el('div', { class: 'topic-content', text: topic.content }),
+    topic.content
+      ? el('div', { class: 'topic-content', text: topic.content })
+      : null,
+    mediaGallery(topic.media),
     el('div', { class: 'topic-actions' }, [likeButton, bookmarkButton, shareButton]),
     el('hr'),
     el('h3', { class: 'replies-title', text: `الردود (${replies.length})` }),
@@ -887,6 +1134,7 @@ function authView(mode) {
       })
 
       state.user = result.user
+      await refreshMe()
       await refreshUnread()
       toast(isLogin ? `أهلاً ${result.user.username}` : 'تم إنشاء حسابك بنجاح')
       navigate('#/')
@@ -907,6 +1155,7 @@ async function viewTopicForm(editId = null) {
 
   const { categories } = await api('/api/categories')
   let initial = { title: '', content: '', category_id: categories[0]?.id }
+  let initialMedia = []
 
   if (editId) {
     const data = await api(`/api/topics/${editId}`)
@@ -919,7 +1168,15 @@ async function viewTopicForm(editId = null) {
       content: data.topic.content,
       category_id: data.topic.category_id
     }
+    initialMedia = data.topic.media || []
   }
+
+  const attach = attachField(initialMedia)
+  const submitBtn = el('button', {
+    class: 'button primary',
+    type: 'submit',
+    text: editId ? 'حفظ التعديلات' : 'نشر الموضوع'
+  })
 
   const form = el('form', { class: 'panel form-card' }, [
     el('p', { class: 'eyebrow', text: editId ? 'EDIT DISCUSSION' : 'NEW DISCUSSION' }),
@@ -936,11 +1193,17 @@ async function viewTopicForm(editId = null) {
     ]),
     el('label', { class: 'field' }, [
       el('span', { text: 'المحتوى' }),
-      el('textarea', { name: 'content', required: true, maxlength: '10000', rows: '12', placeholder: 'اكتب موضوعك هنا…' }, [])
+      el('textarea', { name: 'content', maxlength: '10000', rows: '10', placeholder: 'اكتب موضوعك هنا… أو اكتفِ بمرفق' }, [])
     ]),
+    attach.node,
     el('div', { class: 'form-actions' }, [
-      el('button', { class: 'button primary', type: 'submit', text: editId ? 'حفظ التعديلات' : 'نشر الموضوع' }),
-      el('a', { class: 'button ghost', href: editId ? `#/topic/${editId}` : '#/topics', text: 'إلغاء' })
+      submitBtn,
+      el('a', {
+        class: 'button ghost',
+        href: editId ? `#/topic/${editId}` : '#/topics',
+        text: 'إلغاء',
+        onclick: () => attach.clearPreviews()
+      })
     ])
   ])
 
@@ -951,15 +1214,28 @@ async function viewTopicForm(editId = null) {
     const body = Object.fromEntries(new FormData(form))
     body.categoryId = Number(body.categoryId)
 
+    const label = submitBtn.textContent
+    submitBtn.disabled = true
+    submitBtn.textContent = 'جارٍ النشر…'
+
     try {
+      body.media = await attach.collect()
+
+      if (!String(body.content || '').trim() && !body.media.length) {
+        throw new Error('أضف نصاً للموضوع أو مرفقاً واحداً على الأقل')
+      }
+
       const result = editId
         ? await api(`/api/topics/${editId}`, { method: 'PATCH', body: JSON.stringify(body) })
         : await api('/api/topics', { method: 'POST', body: JSON.stringify(body) })
 
+      attach.clearPreviews()
       toast(editId ? 'تم حفظ التعديلات' : 'تم نشر الموضوع')
       navigate(`#/topic/${result.topic.id}`)
     } catch (error) {
       toast(error.message, 'error')
+      submitBtn.disabled = false
+      submitBtn.textContent = label
     }
   })
 
@@ -1034,8 +1310,66 @@ async function viewProfile(userId) {
   const { profile: user, isFollowing, isSelf } = profile
   const { topics } = await api(`/api/topics?author=${userId}&limit=20`)
 
+  const avatarInputId = `avatar-file-${attachId++}`
+
+  const avatarInput = el('input', {
+    id: avatarInputId,
+    type: 'file',
+    class: 'attach-input',
+    accept: 'image/jpeg,image/png,image/webp,image/gif,image/avif',
+    onchange: async event => {
+      const file = event.target.files && event.target.files[0]
+      event.target.value = ''
+      if (!file) return
+
+      try {
+        const stored = await uploadFile(file, 'avatar')
+        await api('/api/profile', {
+          method: 'PATCH',
+          body: JSON.stringify({ avatar_url: stored.url })
+        })
+        toast('تم تحديث الصورة الشخصية')
+        await refreshMe()
+        viewProfile(userId)
+      } catch (error) {
+        toast(error.message, 'error')
+      }
+    }
+  })
+
+  const avatarColumn = el('div', { class: 'profile-avatar' }, [
+    avatarNode(user, 'big'),
+    isSelf ? avatarInput : null,
+    isSelf
+      ? el('label', { class: 'button ghost small avatar-pick', for: avatarInputId }, [
+          icon('edit', 14),
+          el('span', { text: 'تغيير الصورة' })
+        ])
+      : null,
+    isSelf && user.avatar_url
+      ? el('button', {
+          class: 'button ghost small danger',
+          type: 'button',
+          text: 'إزالة الصورة',
+          onclick: async () => {
+            try {
+              await api('/api/profile', {
+                method: 'PATCH',
+                body: JSON.stringify({ avatar_url: '' })
+              })
+              toast('تمت إزالة الصورة الشخصية')
+              await refreshMe()
+              viewProfile(userId)
+            } catch (error) {
+              toast(error.message, 'error')
+            }
+          }
+        })
+      : null
+  ].filter(Boolean))
+
   const header = el('div', { class: 'profile-card' }, [
-    el('span', { class: 'avatar big', text: user.username.slice(0, 1).toUpperCase() }),
+    avatarColumn,
     el('div', { class: 'profile-info' }, [
       el('h1', { text: user.username }),
       el('div', { class: 'profile-tags' }, [
@@ -1080,19 +1414,33 @@ async function viewProfile(userId) {
   const stats = el('div', { class: 'profile-stats' }, [
     statBlock(user.topic_count, 'موضوع'),
     statBlock(user.reply_count, 'رد'),
+    statBlock(user.likes_received, 'إعجاب'),
+    statBlock(user.views_received, 'مشاهدة'),
     statBlock(user.followers_count, 'متابع'),
     statBlock(user.following_count, 'يتابع')
   ])
 
-  const bioForm = isSelf
+  const profileForm = isSelf
     ? (() => {
         const form = el('form', { class: 'bio-form' }, [
           el('label', { class: 'field' }, [
+            el('span', { text: 'اسم المستخدم' }),
+            el('input', {
+              name: 'username',
+              required: true,
+              minlength: '3',
+              maxlength: '24',
+              pattern: '[a-zA-Z0-9_]+',
+              value: user.username,
+              placeholder: 'يُسمح بالحروف والرقم والشرطة السفلية'
+            })
+          ]),
+          el('label', { class: 'field' }, [
             el('span', { text: 'نبذة عنك' }),
-            el('textarea', { name: 'bio', maxlength: '300', rows: '3', placeholder: 'عرّف بنفسك في سطرين…' })
+            el('textarea', { name: 'bio', maxlength: '300', rows: '3', placeholder: 'عرّف بنفسك في سطرين…' }, [])
           ]),
           el('div', { class: 'form-actions' }, [
-            el('button', { class: 'button primary small', type: 'submit', text: 'حفظ النبذة' })
+            el('button', { class: 'button primary small', type: 'submit', text: 'حفظ البيانات' })
           ])
         ])
 
@@ -1100,12 +1448,18 @@ async function viewProfile(userId) {
 
         form.addEventListener('submit', async event => {
           event.preventDefault()
+          const data = new FormData(form)
+
           try {
             await api('/api/profile', {
               method: 'PATCH',
-              body: JSON.stringify({ bio: new FormData(form).get('bio') })
+              body: JSON.stringify({
+                username: String(data.get('username') || '').trim(),
+                bio: data.get('bio')
+              })
             })
-            toast('تم حفظ النبذة')
+            toast('تم حفظ بياناتك')
+            await refreshMe()
             viewProfile(userId)
           } catch (error) {
             toast(error.message, 'error')
@@ -1119,7 +1473,7 @@ async function viewProfile(userId) {
   renderLayout(el('div', { class: 'profile-page' }, [
     header,
     stats,
-    bioForm,
+    profileForm,
     el('section', { class: 'section-block' }, [
       sectionHeading('POSTS', isSelf ? 'مواضيعك' : `مواضيع ${user.username}`),
       el('div', { class: 'topic-list' },
@@ -1369,7 +1723,7 @@ async function viewAdmin(query) {
 
     return el('div', { class: `admin-row${user.is_banned ? ' banned' : ''}` }, [
       el('div', { class: 'admin-row-head' }, [
-        el('span', { class: 'avatar', text: user.username.slice(0, 1).toUpperCase() }),
+        avatarNode(user),
         el('div', { class: 'admin-row-id' }, [
           el('div', { class: 'admin-row-name' }, [
             el('strong', { text: user.username }),

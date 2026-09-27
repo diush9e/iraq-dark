@@ -130,6 +130,16 @@ const SCHEMA = [
     FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS topic_media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'image',
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_topic_media_topic ON topic_media(topic_id, position)`,
   `CREATE INDEX IF NOT EXISTS idx_topics_category ON topics(category_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_topics_user ON topics(user_id)`,
   `CREATE INDEX IF NOT EXISTS idx_replies_topic ON replies(topic_id, created_at)`,
@@ -608,6 +618,7 @@ function topicSelect(meId, { full = false } = {}) {
       c.name AS category,
       u.id AS author_id,
       u.username,
+      COALESCE(p.avatar_url, '') AS author_avatar,
       (SELECT COUNT(*) FROM replies r WHERE r.topic_id = t.id) AS reply_count,
       (SELECT COUNT(*) FROM likes l WHERE l.topic_id = t.id) AS like_count,
       (SELECT COUNT(*) FROM topic_views v WHERE v.topic_id = t.id) AS view_count,
@@ -616,7 +627,264 @@ function topicSelect(meId, { full = false } = {}) {
     FROM topics t
     JOIN categories c ON c.id = t.category_id
     JOIN users u ON u.id = t.user_id
+    LEFT JOIN user_profiles p ON p.user_id = u.id
   `;
+}
+
+function replySelect(meId) {
+  return `
+    SELECT
+      r.id, r.content, r.created_at,
+      u.id AS author_id,
+      u.username,
+      COALESCE(p.avatar_url, '') AS author_avatar,
+      (SELECT COUNT(*) FROM likes l WHERE l.reply_id = r.id) AS like_count,
+      EXISTS(SELECT 1 FROM likes l WHERE l.reply_id = r.id AND l.user_id = ${Number(meId) || -1}) AS liked
+    FROM replies r
+    JOIN users u ON u.id = r.user_id
+    LEFT JOIN user_profiles p ON p.user_id = u.id
+  `;
+}
+
+/* ---- media ---- */
+
+export const MAX_MEDIA_PER_TOPIC = 4;
+const MEDIA_URL_PATTERN = /^\/media\/[A-Za-z0-9_-]+\.[a-z0-9]{2,5}$/;
+
+/** Returns null when the caller did not send a media list (keep what exists). */
+function cleanMedia(value) {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) return [];
+
+  const out = [];
+  for (const item of value) {
+    if (out.length >= MAX_MEDIA_PER_TOPIC) break;
+    const url = String(item?.url || '');
+    if (!MEDIA_URL_PATTERN.test(url)) continue;
+    out.push({ url, kind: item?.kind === 'video' ? 'video' : 'image' });
+  }
+  return out;
+}
+
+async function attachMedia(db, rows) {
+  if (!rows.length) return rows;
+
+  const ids = rows.map(row => row.id);
+  const placeholders = ids.map(() => '?').join(',');
+
+  const media = await db.prepare(`
+    SELECT topic_id, url, kind
+    FROM topic_media
+    WHERE topic_id IN (${placeholders})
+    ORDER BY position, id
+  `).all(ids);
+
+  const grouped = new Map();
+  for (const item of media) {
+    if (!grouped.has(item.topic_id)) grouped.set(item.topic_id, []);
+    grouped.get(item.topic_id).push(item);
+  }
+
+  for (const row of rows) row.media = grouped.get(row.id) || [];
+  return rows;
+}
+
+async function replaceTopicMedia(db, topicId, media) {
+  await db.prepare('DELETE FROM topic_media WHERE topic_id = ?').run(topicId);
+
+  for (let position = 0; position < media.length; position += 1) {
+    const item = media[position];
+    await db.prepare(
+      'INSERT INTO topic_media (topic_id, url, kind, position) VALUES (?, ?, ?, ?)'
+    ).run(topicId, item.url, item.kind, position);
+  }
+}
+
+/* ---- storage ---- */
+
+export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const MEDIA_FILENAME_PATTERN = /^[A-Za-z0-9_-]+\.[a-z0-9]{2,5}$/;
+
+const UPLOAD_EXTENSIONS = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/avif': 'avif',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov'
+};
+
+const EXTENSION_TYPES = Object.fromEntries(
+  Object.entries(UPLOAD_EXTENSIONS).map(([type, ext]) => [ext, type])
+);
+EXTENSION_TYPES.jpeg = EXTENSION_TYPES.jpg;
+
+export class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export async function findSessionUser(db, sessionId) {
+  if (!sessionId) return null;
+
+  return db.prepare(`
+    SELECT
+      users.id, users.username, users.email, users.role, users.created_at,
+      users.is_banned
+    FROM sessions
+    JOIN users ON users.id = sessions.user_id
+    WHERE sessions.id = ? AND sessions.expires_at > datetime('now')
+  `).get(sessionId) || null;
+}
+
+/**
+ * Store one uploaded file (Workers KV) and return its public URL.
+ * `purpose` is `topic` (feed attachment) or `avatar`.
+ *
+ * KV values cap at 25MB, so uploads are capped at 20MB to leave headroom.
+ */
+export async function storeUpload(request, url, env) {
+  if (request.method !== 'POST') {
+    throw new HttpError(405, 'طريقة الطلب غير مدعومة');
+  }
+
+  const db = createDb(env);
+  await ensureSchema(db);
+
+  const cookies = parseCookies(request.headers.get('Cookie'));
+  const user = await findSessionUser(db, cookies[COOKIE_NAME] || '');
+
+  if (!user) throw new HttpError(401, 'يجب تسجيل الدخول أولا');
+  if (user.is_banned) throw new HttpError(403, 'هذا الحساب موقوف');
+
+  const purpose = url.searchParams.get('purpose') || 'topic';
+  if (purpose !== 'topic' && purpose !== 'avatar') {
+    throw new HttpError(400, 'غرض الرفع غير صالح');
+  }
+
+  const contentType = (request.headers.get('content-type') || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+
+  const extension = UPLOAD_EXTENSIONS[contentType];
+  if (!extension) {
+    throw new HttpError(415, 'نوع الملف غير مدعوم (صور: jpg png webp gif avif — فيديو: mp4 webm mov)');
+  }
+
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (declared > MAX_UPLOAD_BYTES) {
+    throw new HttpError(413, 'الملف أكبر من الحد المسموح (20MB)');
+  }
+
+  const buffer = await request.arrayBuffer();
+  if (buffer.byteLength === 0) throw new HttpError(400, 'الملف فارغ');
+  if (buffer.byteLength > MAX_UPLOAD_BYTES) {
+    throw new HttpError(413, 'الملف أكبر من الحد المسموح (20MB)');
+  }
+
+  if (!env.MEDIA) {
+    throw new HttpError(503, 'الرفع المباشر غير مفعّل على الخادم');
+  }
+
+  const filename = purpose === 'avatar'
+    ? `a${user.id}.${extension}`
+    : `t${user.id}_${randomHex(9)}.${extension}`;
+
+  await env.MEDIA.put(filename, buffer, {
+    metadata: { contentType, kind: contentType.startsWith('video/') ? 'video' : 'image', bytes: buffer.byteLength }
+  });
+
+  return {
+    url: `/media/${filename}`,
+    kind: contentType.startsWith('video/') ? 'video' : 'image',
+    bytes: buffer.byteLength
+  };
+}
+
+/** Stream a stored file back out, with HTTP range support so <video> can seek. */
+export async function serveMedia(request, url, env) {
+  const filename = url.pathname.slice('/media/'.length);
+
+  if (!MEDIA_FILENAME_PATTERN.test(filename)) {
+    throw new HttpError(404, 'الملف غير موجود');
+  }
+
+  if (!env.MEDIA) throw new HttpError(503, 'الرفع المباشر غير مفعّل على الخادم');
+
+  const stored = await env.MEDIA.get(filename, 'arrayBuffer');
+  if (!stored) throw new HttpError(404, 'الملف غير موجود');
+
+  const size = stored.byteLength;
+  const contentType =
+    EXTENSION_TYPES[filename.split('.').pop()] || 'application/octet-stream';
+
+  const baseHeaders = {
+    'Content-Type': contentType,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Disposition': `inline; filename="${filename}"`
+  };
+
+  if (request.method === 'HEAD') {
+    return new Response(null, {
+      status: 200,
+      headers: { ...baseHeaders, 'Content-Length': String(size) }
+    });
+  }
+
+  const range = parseByteRange(request.headers.get('Range'), size);
+
+  if (!range) {
+    return new Response(stored, {
+      status: 200,
+      headers: { ...baseHeaders, 'Content-Length': String(size) }
+    });
+  }
+
+  if (range.start > range.end || range.start >= size) {
+    return new Response(null, {
+      status: 416,
+      headers: { ...baseHeaders, 'Content-Range': `bytes */${size}` }
+    });
+  }
+
+  return new Response(stored.slice(range.start, range.end + 1), {
+    status: 206,
+    headers: {
+      ...baseHeaders,
+      'Content-Length': String(range.end - range.start + 1),
+      'Content-Range': `bytes ${range.start}-${range.end}/${size}`
+    }
+  });
+}
+
+function parseByteRange(header, size) {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return null;
+
+  const [, rawStart, rawEnd] = match;
+  if (!rawStart && !rawEnd) return null;
+
+  if (!rawStart) {
+    const suffix = Number(rawEnd);
+    if (!Number.isFinite(suffix) || suffix <= 0) return null;
+    return { start: Math.max(0, size - suffix), end: size - 1 };
+  }
+
+  const start = Number(rawStart);
+  if (!Number.isFinite(start) || start >= size) return null;
+
+  const end = rawEnd ? Number(rawEnd) : size - 1;
+  if (!Number.isFinite(end) || end < start) return null;
+
+  return { start, end: Math.min(end, size - 1) };
 }
 
 function decorateTopic(row) {
@@ -635,9 +903,11 @@ const ADMIN_USER_SELECT = `
   SELECT
     u.id, u.username, u.email, u.role, u.is_banned, u.banned_reason, u.banned_at,
     u.created_at,
+    COALESCE(p.avatar_url, '') AS avatar_url,
     (SELECT COUNT(*) FROM topics t WHERE t.user_id = u.id) AS topic_count,
     (SELECT COUNT(*) FROM replies r WHERE r.user_id = u.id) AS reply_count
   FROM users u
+  LEFT JOIN user_profiles p ON p.user_id = u.id
 `;
 
 async function loadAdminTarget(req, res) {
@@ -767,18 +1037,50 @@ export function buildRoutes() {
   }));
 
   router.patch('/api/profile', requireUser, requireNotBanned, asyncRoute(async (req, res) => {
-    const bio = String(req.body.bio ?? '').trim();
-    const avatarUrl = String(req.body.avatar_url ?? '').trim();
+    const db = req.db;
+    const patch = {};
 
-    if (bio.length > 300) {
-      return res.status(400).json({ error: 'النبذة أطول من الحد المسموح (300 حرف)' });
+    if (req.body.bio !== undefined) {
+      patch.bio = String(req.body.bio).trim();
+      if (patch.bio.length > 300) {
+        return res.status(400).json({ error: 'النبذة أطول من الحد المسموح (300 حرف)' });
+      }
     }
 
-    if (avatarUrl && !/^(https?:\/\/|\/).{0,500}$/.test(avatarUrl)) {
-      return res.status(400).json({ error: 'رابط الصورة غير صالح' });
+    if (req.body.avatar_url !== undefined) {
+      patch.avatar_url = String(req.body.avatar_url).trim();
+
+      if (patch.avatar_url) {
+        const localUpload = /^\/media\/[A-Za-z0-9_-]+\.[a-z0-9]{2,5}$/.test(patch.avatar_url);
+        const remote = /^https?:\/\/[^\s]{3,500}$/.test(patch.avatar_url);
+
+        if (!localUpload && !remote) {
+          return res.status(400).json({ error: 'رابط الصورة غير صالح' });
+        }
+      }
     }
 
-    await req.db.prepare(`
+    if (req.body.username !== undefined) {
+      patch.username = String(req.body.username).trim();
+
+      if (!/^[a-zA-Z0-9_]{3,24}$/.test(patch.username)) {
+        return res.status(400).json({ error: 'اسم المستخدم يجب أن يكون 3-24 حرفاً أو رقماً (بالإنجليزية)' });
+      }
+
+      const taken = await db.prepare('SELECT 1 FROM users WHERE username = ? AND id <> ?')
+        .get(patch.username, req.user.id);
+
+      if (taken) return res.status(409).json({ error: 'اسم المستخدم مستخدم من حساب آخر' });
+    }
+
+    const current = await db.prepare(
+      'SELECT bio, avatar_url FROM user_profiles WHERE user_id = ?'
+    ).get(req.user.id) || { bio: '', avatar_url: '' };
+
+    const bio = 'bio' in patch ? patch.bio : current.bio;
+    const avatarUrl = 'avatar_url' in patch ? patch.avatar_url : current.avatar_url;
+
+    await db.prepare(`
       INSERT INTO user_profiles (user_id, bio, avatar_url, updated_at)
       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(user_id) DO UPDATE SET
@@ -787,7 +1089,17 @@ export function buildRoutes() {
         updated_at = CURRENT_TIMESTAMP
     `).run(req.user.id, bio, avatarUrl);
 
-    return res.json({ ok: true, bio, avatar_url: avatarUrl });
+    if (patch.username && patch.username !== req.user.username) {
+      await db.prepare('UPDATE users SET username = ? WHERE id = ?')
+        .run(patch.username, req.user.id);
+    }
+
+    return res.json({
+      ok: true,
+      bio,
+      avatar_url: avatarUrl,
+      username: patch.username || req.user.username
+    });
   }));
 
   router.get('/api/users/:id/profile', asyncRoute(async (req, res) => {
@@ -805,7 +1117,15 @@ export function buildRoutes() {
         (SELECT COUNT(*) FROM topics WHERE topics.user_id = users.id) AS topic_count,
         (SELECT COUNT(*) FROM replies WHERE replies.user_id = users.id) AS reply_count,
         (SELECT COUNT(*) FROM follows WHERE follows.following_id = users.id) AS followers_count,
-        (SELECT COUNT(*) FROM follows WHERE follows.follower_id = users.id) AS following_count
+        (SELECT COUNT(*) FROM follows WHERE follows.follower_id = users.id) AS following_count,
+        (
+          (SELECT COUNT(*) FROM likes l JOIN topics lt ON lt.id = l.topic_id WHERE lt.user_id = users.id)
+          +
+          (SELECT COUNT(*) FROM likes l JOIN replies lr ON lr.id = l.reply_id WHERE lr.user_id = users.id)
+        ) AS likes_received,
+        (
+          SELECT COUNT(*) FROM topic_views v JOIN topics lt ON lt.id = v.topic_id WHERE lt.user_id = users.id
+        ) AS views_received
       FROM users
       LEFT JOIN user_profiles p ON p.user_id = users.id
       WHERE users.id = ?
@@ -952,6 +1272,8 @@ export function buildRoutes() {
       LIMIT ? OFFSET ?
     `).all([...values, limit, (page - 1) * limit]);
 
+    await attachMedia(db, rows);
+
     res.json({
       topics: rows.map(decorateTopic),
       pagination: {
@@ -965,11 +1287,13 @@ export function buildRoutes() {
 
   router.post('/api/topics', requireUser, requireNotBanned, asyncRoute(async (req, res) => {
     const db = req.db;
+    const media = cleanMedia(req.body.media) || [];
     const title = cleanText(req.body.title, 120);
-    const content = cleanText(req.body.content, 10000);
+    const body = String(req.body.content || '').trim();
+    const content = body.length > 10000 ? null : body;
     const categoryId = cleanInt(req.body.categoryId);
 
-    if (!title || !content || !categoryId) {
+    if (!title || content === null || !categoryId || (!content && !media.length)) {
       return res.status(400).json({ error: 'العنوان والمحتوى والقسم مطلوبة' });
     }
 
@@ -983,8 +1307,12 @@ export function buildRoutes() {
       'INSERT INTO topics (category_id, user_id, title, content) VALUES (?, ?, ?, ?)'
     ).run(categoryId, req.user.id, title, content);
 
+    await replaceTopicMedia(db, result.lastInsertRowid, media);
+
     const topic = await db.prepare(`${topicSelect(req.user.id)} WHERE t.id = ?`)
       .get(result.lastInsertRowid);
+
+    await attachMedia(db, [topic]);
 
     return res.status(201).json({ topic: decorateTopic(topic) });
   }));
@@ -1018,17 +1346,12 @@ export function buildRoutes() {
     }
 
     const replies = await db.prepare(`
-      SELECT
-        r.id, r.content, r.created_at,
-        u.id AS author_id,
-        u.username,
-        (SELECT COUNT(*) FROM likes l WHERE l.reply_id = r.id) AS like_count,
-        EXISTS(SELECT 1 FROM likes l WHERE l.reply_id = r.id AND l.user_id = ?) AS liked
-      FROM replies r
-      JOIN users u ON u.id = r.user_id
+      ${replySelect(meId)}
       WHERE r.topic_id = ?
       ORDER BY r.created_at ASC, r.id ASC
-    `).all(meId, topicId);
+    `).all(topicId);
+
+    await attachMedia(db, [topic]);
 
     res.json({
       topic: decorateTopic(topic),
@@ -1046,18 +1369,27 @@ export function buildRoutes() {
       return res.status(403).json({ error: 'لا تملك صلاحية تعديل هذا الموضوع' });
     }
 
+    const media = cleanMedia(req.body.media);
     const title = cleanText(req.body.title, 120);
-    const content = cleanText(req.body.content, 10000);
+    const body = String(req.body.content || '').trim();
+    const content = body.length > 10000 ? null : body;
     const categoryId = cleanInt(req.body.categoryId);
 
-    if (!title || !content || !categoryId) {
+    const hasMedia = media
+      ? media.length > 0
+      : Boolean(await db.prepare('SELECT 1 FROM topic_media WHERE topic_id = ?').get(topicId));
+
+    if (!title || content === null || !categoryId || (!content && !hasMedia)) {
       return res.status(400).json({ error: 'العنوان والمحتوى والقسم مطلوبة' });
     }
 
     await db.prepare('UPDATE topics SET title = ?, content = ?, category_id = ? WHERE id = ?')
       .run(title, content, categoryId, topicId);
 
+    if (media) await replaceTopicMedia(db, topicId, media);
+
     const updated = await db.prepare(`${topicSelect(req.user.id)} WHERE t.id = ?`).get(topicId);
+    await attachMedia(db, [updated]);
     return res.json({ topic: decorateTopic(updated) });
   }));
 
@@ -1074,6 +1406,7 @@ export function buildRoutes() {
     // Explicit deletes keep this correct even without FK cascade enforcement.
     await db.batch([
       ['DELETE FROM replies WHERE topic_id = ?', topicId],
+      ['DELETE FROM topic_media WHERE topic_id = ?', topicId],
       ['DELETE FROM likes WHERE topic_id = ?', topicId],
       ['DELETE FROM bookmarks WHERE topic_id = ?', topicId],
       ['DELETE FROM topic_views WHERE topic_id = ?', topicId],
@@ -1187,14 +1520,7 @@ export function buildRoutes() {
     });
 
     const reply = await db.prepare(`
-      SELECT
-        r.id, r.content, r.created_at,
-        u.id AS author_id,
-        u.username,
-        0 AS like_count,
-        0 AS liked
-      FROM replies r
-      JOIN users u ON u.id = r.user_id
+      ${replySelect(req.user.id)}
       WHERE r.id = ?
     `).get(result.lastInsertRowid);
 
@@ -1490,6 +1816,7 @@ export function buildRoutes() {
       ['DELETE FROM notifications WHERE user_id = ? OR actor_id = ?', target.id, target.id],
       ['DELETE FROM topic_views WHERE user_id = ?', target.id],
       ['DELETE FROM notifications WHERE topic_id IN (SELECT id FROM topics WHERE user_id = ?)', target.id],
+      ['DELETE FROM topic_media WHERE topic_id IN (SELECT id FROM topics WHERE user_id = ?)', target.id],
       ['DELETE FROM likes WHERE topic_id IN (SELECT id FROM topics WHERE user_id = ?)', target.id],
       ['DELETE FROM bookmarks WHERE topic_id IN (SELECT id FROM topics WHERE user_id = ?)', target.id],
       ['DELETE FROM topic_views WHERE topic_id IN (SELECT id FROM topics WHERE user_id = ?)', target.id],

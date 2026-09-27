@@ -11,6 +11,11 @@ binding = "DB"
 database_name = "iraq-dark-db"
 database_id = "02a3d52d-e936-468a-8847-7baf7d1bc7af"
 
+# User uploads (avatars, topic attachments) — Workers KV (free tier, no card).
+[[kv_namespaces]]
+binding = "MEDIA"
+id = "69cdbc736b3f4b5e9d71e0aaf8c296fd"
+
 [triggers]
 crons = ["0 */6 * * *"]
 

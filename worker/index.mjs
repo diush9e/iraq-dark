@@ -15,7 +15,10 @@ import {
   ApiResponse,
   COOKIE_NAME,
   SECURE_HEADERS,
-  JSON_LIMIT
+  JSON_LIMIT,
+  HttpError,
+  storeUpload,
+  serveMedia
 } from './app.mjs';
 
 const router = buildRoutes();
@@ -138,9 +141,11 @@ async function handleApi(request, url, env) {
   req.user = await db.prepare(`
     SELECT
       users.id, users.username, users.email, users.role, users.created_at,
-      users.is_banned
+      users.is_banned,
+      COALESCE(p.avatar_url, '') AS avatar_url
     FROM sessions
     JOIN users ON users.id = sessions.user_id
+    LEFT JOIN user_profiles p ON p.user_id = users.id
     WHERE sessions.id = ? AND sessions.expires_at > datetime('now')
   `).get(req.cookies[COOKIE_NAME] || '') || null;
 
@@ -161,6 +166,65 @@ async function handleApi(request, url, env) {
   }
 
   return res.toResponse();
+}
+
+/**
+ * Raw body upload (not JSON) — POST /api/media?purpose=topic|avatar
+ */
+async function handleMediaUpload(request, url, env) {
+  const res = new ApiResponse();
+  res.set(SECURE_HEADERS);
+  applyCors(request, res, url);
+
+  if (request.method === 'OPTIONS') {
+    res.status(204);
+    return res.toResponse();
+  }
+
+  try {
+    const result = await storeUpload(request, url, env);
+    res.json(result);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      res.status(error.status).json({ error: error.message });
+    } else {
+      console.error('upload error', error);
+      res.status(500).json({ error: 'حدث خطأ أثناء رفع الملف' });
+    }
+  }
+
+  return res.toResponse();
+}
+
+/** GET /media/<filename> — public bytes, immutable cache, range-capable. */
+async function handleMediaServe(request, url, env) {
+  const withSecurity = headers => {
+    for (const [key, value] of Object.entries(SECURE_HEADERS)) headers.set(key, value);
+    headers.set('Access-Control-Allow-Origin', '*');
+    return headers;
+  };
+
+  try {
+    const response = await serveMedia(request, url, env);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: withSecurity(new Headers(response.headers))
+    });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return new Response(JSON.stringify({ error: error.message }), {
+        status: error.status,
+        headers: withSecurity(new Headers({ 'Content-Type': 'application/json; charset=utf-8' }))
+      });
+    }
+
+    console.error('media error', error);
+    return new Response(JSON.stringify({ error: 'حدث خطأ في الخادم' }), {
+      status: 500,
+      headers: withSecurity(new Headers({ 'Content-Type': 'application/json; charset=utf-8' }))
+    });
+  }
 }
 
 async function serveAsset(request, url, env) {
@@ -189,6 +253,12 @@ export default {
     const url = new URL(request.url);
 
     try {
+      if (url.pathname === '/api/media') {
+        return await handleMediaUpload(request, url, env);
+      }
+      if (url.pathname.startsWith('/media/')) {
+        return await handleMediaServe(request, url, env);
+      }
       if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
         return await handleApi(request, url, env);
       }
