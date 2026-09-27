@@ -668,11 +668,25 @@ async function viewHome() {
           : el('a', { class: 'button ghost', href: '#/register' }, [el('span', { text: 'انضم إلينا' })])
       ])
     ]),
-    el('div', { class: 'hero-stats' }, [
-      statBlock(stats.topics, 'موضوع'),
-      statBlock(stats.replies, 'رد'),
-      statBlock(stats.members, 'عضو'),
-      statBlock(stats.online, 'جلسة نشطة')
+    el('div', { class: 'hero-side' }, [
+      el('div', { class: 'hero-art' }, [
+        el('img', {
+          class: 'hero-art-img',
+          src: '/images/admin-anime.gif',
+          alt: 'النخبه'
+        }),
+        el('span', { class: 'hero-art-scrim', 'aria-hidden': 'true' }),
+        el('div', { class: 'hero-art-label' }, [
+          el('strong', { text: 'النخبه' }),
+          el('span', { text: 'IRAQ DARK' })
+        ])
+      ]),
+      el('div', { class: 'hero-stats' }, [
+        statBlock(stats.topics, 'موضوع'),
+        statBlock(stats.replies, 'رد'),
+        statBlock(stats.members, 'عضو'),
+        statBlock(stats.online, 'جلسة نشطة')
+      ])
     ])
   ])
 
@@ -1853,14 +1867,28 @@ async function viewAdmin(query) {
     : null
 
   renderLayout(el('section', { class: 'panel page-panel admin-page' }, [
-    el('div', { class: 'section-heading' }, [
-      sectionHeading('CONTROL ROOM', 'لوحة التحكم'),
-      el('button', {
-        class: 'button ghost small',
-        type: 'button',
-        text: 'تحديث',
-        onclick: refresh
-      })
+    el('div', { class: 'admin-hero' }, [
+      el('div', { class: 'admin-hero-copy' }, [
+        sectionHeading('CONTROL ROOM', 'لوحة التحكم'),
+        el('p', {
+          class: 'muted admin-hero-text',
+          text: 'راقب الأعضاء والمواضيع والجلسات النشطة، ونظّم الصلاحيات من مكان واحد.'
+        }),
+        el('button', {
+          class: 'button ghost small',
+          type: 'button',
+          text: 'تحديث',
+          onclick: refresh
+        })
+      ]),
+      el('div', { class: 'admin-hero-art' }, [
+        el('img', {
+          class: 'admin-hero-gif',
+          src: '/images/admin-anime.gif',
+          alt: 'لوحة زينة بأسلوب الأنمي'
+        }),
+        el('span', { class: 'admin-hero-glow', 'aria-hidden': 'true' })
+      ])
     ]),
     statsBlock,
     el('div', { class: 'filters' }, [searchForm]),
