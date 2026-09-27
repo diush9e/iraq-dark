@@ -19,6 +19,10 @@ uploads/
 *.db-shm
 *.db-wal
 
+# Cloudflare local state + generated D1 migration (contains user emails)
+.wrangler/
+migrate.sql
+
 # Local backups / snapshots
 *.backup*
 *.before-*

@@ -10,7 +10,12 @@
     "preview": "vite preview",
     "start": "node server/start.cjs",
     "db:init": "node server/init-db.cjs",
-    "db:upgrade": "node server/upgrade-db.cjs"
+    "db:upgrade": "node server/upgrade-db.cjs",
+    "db:admin": "node server/set-role.cjs",
+    "db:export": "node scripts/export-d1.mjs",
+    "deploy": "npm run build && wrangler deploy",
+    "deploy:d1": "wrangler d1 execute iraq-dark-db --remote --file=./migrate.sql",
+    "dev:worker": "wrangler dev --port 8787"
   },
   "devDependencies": {
     "vite": "^8.3.0"

@@ -1651,3 +1651,138 @@ textarea::placeholder {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* --------------------------------------------------------------------------
+   Admin panel
+   -------------------------------------------------------------------------- */
+
+.admin-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 12px;
+  margin-bottom: 22px;
+  padding: 18px;
+  border: 1px solid rgba(201, 166, 107, 0.28);
+  border-radius: var(--radius);
+  background: rgba(15, 15, 16, 0.7);
+}
+
+.admin-list {
+  display: grid;
+  gap: 12px;
+}
+
+.admin-row {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.025);
+  transition: border-color 160ms ease, background 160ms ease;
+}
+
+.admin-row:hover {
+  border-color: rgba(201, 166, 107, 0.35);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.admin-row.banned {
+  border-color: rgba(215, 101, 95, 0.45);
+  background: rgba(215, 101, 95, 0.05);
+}
+
+.admin-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+
+.admin-row-id {
+  flex: 1;
+  min-width: 220px;
+}
+
+.admin-row-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
+.admin-row-name strong {
+  color: #f3efe8;
+  font-size: 1.02rem;
+}
+
+.admin-row-id small {
+  display: block;
+  font-size: 0.82rem;
+}
+
+.admin-ban-reason {
+  margin-top: 3px;
+  color: var(--danger);
+}
+
+.admin-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.admin-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.admin-edit-form {
+  max-width: none;
+  margin-top: 16px;
+  padding: 18px;
+  border: 1px dashed rgba(201, 166, 107, 0.45);
+  background: rgba(201, 166, 107, 0.04);
+}
+
+.chip.banned {
+  color: #171513;
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+.chip.self {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--line-strong);
+}
+
+.chip-divider {
+  padding: 0 4px;
+  color: var(--text-faint);
+  border: 0;
+  background: transparent;
+}
+
+@media (max-width: 640px) {
+  .admin-row-actions {
+    width: 100%;
+  }
+
+  .admin-row-actions .button {
+    flex: 1;
+  }
+}
+
+.admin-edit-form.ban-form {
+  border-color: rgba(215, 101, 95, 0.55);
+  background: rgba(215, 101, 95, 0.06);
+}
+
+.admin-edit-form.ban-form input:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px rgba(215, 101, 95, 0.14);
+}

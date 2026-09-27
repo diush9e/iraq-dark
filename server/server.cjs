@@ -42,6 +42,15 @@ const db = new Database(path.join(dataDir, 'iraq-dark.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+/** Add a column to an existing table when the schema is upgraded. */
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info("${table}")`).all();
+
+  if (!columns.some(col => col.name === column)) {
+    db.exec(`ALTER TABLE "${table}" ADD COLUMN ${column} ${definition}`);
+  }
+}
+
 function ensureSchema() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -50,6 +59,9 @@ function ensureSchema() {
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'member',
+      is_banned INTEGER NOT NULL DEFAULT 0,
+      banned_reason TEXT NOT NULL DEFAULT '',
+      banned_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -163,6 +175,11 @@ function ensureSchema() {
     CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
   `);
 
+  // Upgrade pre-existing databases (users created before the admin panel).
+  ensureColumn('users', 'is_banned', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('users', 'banned_reason', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('users', 'banned_at', 'TEXT');
+
   seedCategories();
 }
 
@@ -246,7 +263,8 @@ function getUser(req) {
 
   const row = db.prepare(`
     SELECT
-      users.id, users.username, users.email, users.role, users.created_at
+      users.id, users.username, users.email, users.role, users.created_at,
+      users.is_banned
     FROM sessions
     JOIN users ON users.id = sessions.user_id
     WHERE sessions.id = ? AND sessions.expires_at > datetime('now')
@@ -268,6 +286,28 @@ function requireUser(req, res, next) {
   }
 
   req.user = user;
+  next();
+}
+
+/** Admin-only routes: 401 when logged out, 403 when not an admin. */
+function requireAdmin(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'يجب تسجيل الدخول أولا' });
+  }
+
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'هذه الصفحة مخصصة للمديرين فقط' });
+  }
+
+  next();
+}
+
+/** Banned members may browse, but they cannot publish anything. */
+function requireNotBanned(req, res, next) {
+  if (req.user && Number(req.user.is_banned) === 1) {
+    return res.status(403).json({ error: 'حسابك موقوف عن النشر — تواصل مع الإدارة' });
+  }
+
   next();
 }
 
@@ -496,7 +536,7 @@ app.get('/api/profile', requireUser, (req, res) => {
   res.json({ profile: { ...profile, created_at: toIso(profile.created_at) } });
 });
 
-app.patch('/api/profile', requireUser, (req, res) => {
+app.patch('/api/profile', requireUser, requireNotBanned, (req, res) => {
   const bio = String(req.body.bio ?? '').trim();
   const avatarUrl = String(req.body.avatar_url ?? '').trim();
 
@@ -561,7 +601,7 @@ app.get('/api/users/:id/profile', (req, res) => {
   });
 });
 
-app.post('/api/users/:id/follow', requireUser, (req, res) => {
+app.post('/api/users/:id/follow', requireUser, requireNotBanned, (req, res) => {
   const followingId = cleanInt(req.params.id);
 
   if (!followingId) {
@@ -700,7 +740,7 @@ app.get('/api/topics', (req, res) => {
   });
 });
 
-app.post('/api/topics', requireUser, (req, res) => {
+app.post('/api/topics', requireUser, requireNotBanned, (req, res) => {
   const title = cleanText(req.body.title, 120);
   const content = cleanText(req.body.content, 10000);
   const categoryId = cleanInt(req.body.categoryId);
@@ -777,7 +817,7 @@ app.get('/api/topics/:id', (req, res) => {
   });
 });
 
-app.patch('/api/topics/:id', requireUser, (req, res) => {
+app.patch('/api/topics/:id', requireUser, requireNotBanned, (req, res) => {
   const topicId = cleanInt(req.params.id);
   const topic = topicId ? db.prepare('SELECT * FROM topics WHERE id = ?').get(topicId) : null;
 
@@ -820,7 +860,7 @@ app.delete('/api/topics/:id', requireUser, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/topics/:id/like', requireUser, (req, res) => {
+app.post('/api/topics/:id/like', requireUser, requireNotBanned, (req, res) => {
   const topicId = cleanInt(req.params.id);
   const topic = topicId ? db.prepare('SELECT * FROM topics WHERE id = ?').get(topicId) : null;
 
@@ -893,7 +933,7 @@ app.get('/api/bookmarks', requireUser, (req, res) => {
 // Replies
 // ---------------------------------------------------------------------------
 
-app.post('/api/topics/:id/replies', requireUser, (req, res) => {
+app.post('/api/topics/:id/replies', requireUser, requireNotBanned, (req, res) => {
   const topicId = cleanInt(req.params.id);
   const content = cleanText(req.body.content, 5000);
 
@@ -950,7 +990,7 @@ app.delete('/api/replies/:id', requireUser, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/replies/:id/like', requireUser, (req, res) => {
+app.post('/api/replies/:id/like', requireUser, requireNotBanned, (req, res) => {
   const replyId = cleanInt(req.params.id);
   const reply = replyId
     ? db.prepare('SELECT id, user_id, topic_id FROM replies WHERE id = ?').get(replyId)
@@ -1028,6 +1068,254 @@ app.post('/api/notifications/read', requireUser, (req, res) => {
   ).get(req.user.id).c;
 
   res.json({ ok: true, count });
+});
+
+// ---------------------------------------------------------------------------
+// Admin
+// ---------------------------------------------------------------------------
+
+const adminUserSelect = `
+  SELECT
+    u.id, u.username, u.email, u.role, u.is_banned, u.banned_reason, u.banned_at,
+    u.created_at,
+    (SELECT COUNT(*) FROM topics t WHERE t.user_id = u.id) AS topic_count,
+    (SELECT COUNT(*) FROM replies r WHERE r.user_id = u.id) AS reply_count
+  FROM users u
+`;
+
+const ROLES = ['admin', 'member'];
+
+function loadAdminTarget(req, res) {
+  const userId = cleanInt(req.params.id);
+
+  if (!userId) {
+    res.status(400).json({ error: 'معرف المستخدم غير صحيح' });
+    return null;
+  }
+
+  const user = db.prepare('SELECT id, username, role FROM users WHERE id = ?').get(userId);
+
+  if (!user) {
+    res.status(404).json({ error: 'المستخدم غير موجود' });
+    return null;
+  }
+
+  return user;
+}
+
+/** Never let the last remaining admin demote or delete themselves. */
+function adminGuard(req, res, target, action) {
+  if (target.id !== req.user.id || target.role !== 'admin') return true;
+
+  const admins = db.prepare(
+    "SELECT COUNT(*) AS c FROM users WHERE role = 'admin'"
+  ).get().c;
+
+  if (admins > 1) return true;
+
+  res.status(400).json({ error: `لا يمكن ${action} آخر مدير في الموقع` });
+  return false;
+}
+
+app.get('/api/admin/overview', requireUser, requireAdmin, (req, res) => {
+  const stats = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM users) AS members,
+      (SELECT COUNT(*) FROM users WHERE role = 'admin') AS admins,
+      (SELECT COUNT(*) FROM users WHERE is_banned = 1) AS banned,
+      (SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')) AS week_members,
+      (SELECT COUNT(*) FROM topics) AS topics,
+      (SELECT COUNT(*) FROM replies) AS replies,
+      (SELECT COUNT(*) FROM sessions WHERE expires_at > datetime('now')) AS online
+  `).get();
+
+  res.json({ stats });
+});
+
+app.get('/api/admin/users', requireUser, requireAdmin, (req, res) => {
+  const search = String(req.query.q || '').trim().slice(0, 100);
+  const role = ROLES.includes(req.query.role) ? req.query.role : '';
+  const status = ['banned', 'active'].includes(req.query.status) ? req.query.status : '';
+
+  const page = Math.max(1, cleanInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, cleanInt(req.query.limit) || 20));
+
+  const where = [];
+  const params = { meId: req.user.id };
+
+  if (search) {
+    where.push(`(u.username LIKE @search ESCAPE '\\' OR u.email LIKE @search ESCAPE '\\')`);
+    params.search = `%${search.replace(/[\\%_]/g, ch => `\\${ch}`)}%`;
+  }
+
+  if (role) {
+    where.push('u.role = @role');
+    params.role = role;
+  }
+
+  if (status === 'banned') where.push('u.is_banned = 1');
+  if (status === 'active') where.push('u.is_banned = 0');
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const total = db.prepare(
+    `SELECT COUNT(*) AS c FROM users u ${whereSql}`
+  ).get(params).c;
+
+  const rows = db.prepare(`
+    ${adminUserSelect}
+    ${whereSql}
+    ORDER BY (u.id = @meId) DESC, u.created_at DESC
+    LIMIT @limit OFFSET @offset
+  `).all({ ...params, limit, offset: (page - 1) * limit });
+
+  res.json({
+    users: rows.map(row => ({
+      ...row,
+      is_banned: Number(row.is_banned) === 1,
+      created_at: toIso(row.created_at),
+      banned_at: toIso(row.banned_at)
+    })),
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.max(1, Math.ceil(total / limit))
+    }
+  });
+});
+
+app.patch('/api/admin/users/:id', requireUser, requireAdmin, (req, res) => {
+  const target = loadAdminTarget(req, res);
+  if (!target) return;
+
+  const updates = [];
+  const values = [];
+  const messages = [];
+
+  if (req.body.role !== undefined) {
+    const role = String(req.body.role);
+
+    if (!ROLES.includes(role)) {
+      return res.status(400).json({ error: 'الدور غير صالح' });
+    }
+
+    if (role !== target.role) {
+      if (role === 'member' && !adminGuard(req, res, target, 'تخفيض صلاحية')) return;
+
+      updates.push('role = ?');
+      values.push(role);
+      messages.push(role === 'admin' ? 'ترقية إلى مدير' : 'تخفيض إلى عضو');
+    }
+  }
+
+  if (req.body.is_banned !== undefined) {
+    const banned = Boolean(req.body.is_banned);
+
+    if (banned && !adminGuard(req, res, target, 'إيقاف')) return;
+
+    const reason = banned
+      ? String(req.body.banned_reason || 'مخالفة قوانين المنتدى').trim().slice(0, 200)
+      : '';
+
+    updates.push('is_banned = ?', 'banned_reason = ?', 'banned_at = ?');
+    values.push(banned ? 1 : 0, reason, banned ? new Date().toISOString() : null);
+    messages.push(banned ? 'إيقاف عن النشر' : 'رفع الإيقاف');
+
+    if (banned) {
+      // Kill every live session so the ban takes effect immediately.
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);
+    }
+  }
+
+  if (req.body.username !== undefined) {
+    const username = String(req.body.username).trim();
+
+    if (!/^[a-zA-Z0-9_]{3,24}$/.test(username)) {
+      return res.status(400).json({ error: 'اسم المستخدم يجب أن يكون 3-24 حرفاً أو رقماً (بالإنجليزية)' });
+    }
+
+    const taken = db.prepare(
+      'SELECT 1 FROM users WHERE username = ? AND id <> ?'
+    ).get(username, target.id);
+
+    if (taken) return res.status(409).json({ error: 'اسم المستخدم مستخدم من حساب آخر' });
+
+    if (username !== target.username) {
+      updates.push('username = ?');
+      values.push(username);
+      messages.push('تعديل اسم المستخدم');
+    }
+  }
+
+  if (req.body.email !== undefined) {
+    const email = String(req.body.email).trim().toLowerCase();
+
+    if (!email.includes('@') || email.length > 120) {
+      return res.status(400).json({ error: 'البريد الإلكتروني غير صحيح' });
+    }
+
+    const taken = db.prepare(
+      'SELECT 1 FROM users WHERE lower(email) = ? AND id <> ?'
+    ).get(email, target.id);
+
+    if (taken) return res.status(409).json({ error: 'البريد مستخدم من حساب آخر' });
+
+    updates.push('email = ?');
+    values.push(email);
+    messages.push('تعديل البريد الإلكتروني');
+  }
+
+  if (!updates.length) {
+    return res.json({ ok: true, changed: [] });
+  }
+
+  db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`)
+    .run(...values, target.id);
+
+  const user = db.prepare(`${adminUserSelect} WHERE u.id = ?`).get(target.id);
+
+  res.json({
+    ok: true,
+    changed: messages,
+    user: {
+      ...user,
+      is_banned: Number(user.is_banned) === 1,
+      created_at: toIso(user.created_at),
+      banned_at: toIso(user.banned_at)
+    }
+  });
+});
+
+app.delete('/api/admin/users/:id', requireUser, requireAdmin, (req, res) => {
+  const target = loadAdminTarget(req, res);
+  if (!target) return;
+
+  if (target.id === req.user.id) {
+    return res.status(400).json({ error: 'لا يمكنك حذف حسابك من هذه الصفحة' });
+  }
+
+  if (target.role === 'admin' && !adminGuard(req, res, target, 'حذف')) return;
+
+  const wipe = db.transaction(() => {
+    // Explicit deletes first: topics/replies FKs to users are not cascading.
+    db.prepare('DELETE FROM replies WHERE user_id = ?').run(target.id);
+    db.prepare('DELETE FROM likes WHERE user_id = ?').run(target.id);
+    db.prepare('DELETE FROM bookmarks WHERE user_id = ?').run(target.id);
+    db.prepare('DELETE FROM follows WHERE follower_id = ? OR following_id = ?')
+      .run(target.id, target.id);
+    db.prepare('DELETE FROM notifications WHERE user_id = ? OR actor_id = ?')
+      .run(target.id, target.id);
+    db.prepare('DELETE FROM topic_views WHERE user_id = ?').run(target.id);
+    db.prepare('DELETE FROM topics WHERE user_id = ?').run(target.id);
+    db.prepare('DELETE FROM user_profiles WHERE user_id = ?').run(target.id);
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);
+    db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+  });
+
+  wipe();
+
+  res.json({ ok: true, deleted: target.username });
 });
 
 // ---------------------------------------------------------------------------

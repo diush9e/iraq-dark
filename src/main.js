@@ -13,6 +13,9 @@ const state = {
   lastRoute: ''
 }
 
+/** Ephemeral UI state for the admin panel (which row is being edited). */
+const adminUi = { editingId: null, banId: null }
+
 /* --------------------------------------------------------------------------
    Tiny DOM helper
    -------------------------------------------------------------------------- */
@@ -68,7 +71,10 @@ const ICONS = {
   home: '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
   grid: '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>',
   check: '<polyline points="20 6 9 17 4 12"/>',
-  close: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>'
+  close: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  ban: '<circle cx="12" cy="12" r="9"/><line x1="5.6" y1="5.6" x2="18.4" y2="18.4"/>'
 }
 
 function icon(name, size = 18) {
@@ -256,6 +262,9 @@ function renderHeader(route) {
             text: String(state.unread)
           })
         ])
+      : null,
+    state.user && state.user.role === 'admin'
+      ? navLink('#/admin', 'لوحة التحكم', current === 'admin', 'shield')
       : null
   ]
 
@@ -1119,6 +1128,394 @@ async function viewProfile(userId) {
   ].filter(Boolean)))
 }
 
+/* --------------------------------------------------------------------------
+   Admin panel — visible to admins only (server enforces it too)
+   -------------------------------------------------------------------------- */
+
+async function viewAdmin(query) {
+  if (!state.user) {
+    toast('يجب تسجيل الدخول أولا', 'error')
+    return navigate('#/login')
+  }
+
+  if (state.user.role !== 'admin') {
+    return renderLayout(el('section', { class: 'panel page-panel center-panel' }, [
+      el('p', { class: 'eyebrow', text: '403' }),
+      el('h2', { text: 'غير مخوّل' }),
+      el('p', { class: 'muted', text: 'لوحة التحكم مخصصة لمسؤول الموقع فقط.' }),
+      el('a', { class: 'button primary', href: '#/', text: 'العودة للرئيسية' })
+    ]))
+  }
+
+  const params = {
+    q: query.get('q') || '',
+    role: query.get('role') || '',
+    status: query.get('status') || '',
+    page: Math.max(1, Number(query.get('page')) || 1)
+  }
+
+  const setParam = (key, value) => {
+    const next = { ...params, [key]: value }
+    if (key !== 'page') next.page = 1
+    navigate(`#/admin${queryString(next)}`)
+  }
+
+  const [{ stats }, { users, pagination }] = await Promise.all([
+    api('/api/admin/overview'),
+    api(`/api/admin/users${queryString(params)}`)
+  ])
+
+  const refresh = () => viewAdmin(parseRoute().query)
+
+  async function patch(userId, body, successMessage) {
+    try {
+      await api(`/api/admin/users/${userId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(body)
+      })
+      toast(successMessage)
+      return true
+    } catch (error) {
+      toast(error.message, 'error')
+      return false
+    }
+  }
+
+  function adminRow(user) {
+    const isSelf = user.id === state.user.id
+    const editing = adminUi.editingId === user.id
+
+    const roleChip = el('span', {
+      class: `chip role ${user.role}`,
+      text: user.role === 'admin' ? 'مدير' : 'عضو'
+    })
+
+    const statusChip = user.is_banned
+      ? el('span', { class: 'chip banned', text: 'موقوف' })
+      : null
+
+    const roleAction = isSelf
+      ? null
+      : el('button', {
+          class: 'button ghost small',
+          type: 'button',
+          text: user.role === 'admin' ? 'تخفيض' : 'ترقية',
+          onclick: async () => {
+            const next = user.role === 'admin' ? 'member' : 'admin'
+
+            if (next === 'member' && !window.confirm(`تخفيض ${user.username} إلى عضو عادي؟`)) return
+
+            const ok = await patch(
+              user.id,
+              { role: next },
+              next === 'admin' ? `تمت ترقية ${user.username} إلى مدير` : `تم تخفيض ${user.username}`
+            )
+
+            if (ok) refresh()
+          }
+        })
+
+    const banning = adminUi.banId === user.id
+
+    const banAction = isSelf
+      ? null
+      : user.is_banned
+        ? el('button', {
+            class: 'button primary small',
+            type: 'button',
+            text: 'رفع الإيقاف',
+            onclick: async () => {
+              if (!window.confirm(`رفع الإيقاف عن ${user.username}؟`)) return
+
+              const ok = await patch(
+                user.id,
+                { is_banned: false },
+                `رُفع الإيقاف عن ${user.username}`
+              )
+
+              if (ok) refresh()
+            }
+          })
+        : el('button', {
+            class: 'button ghost small',
+            type: 'button',
+            text: 'إيقاف',
+            onclick: () => {
+              adminUi.banId = user.id
+              adminUi.editingId = null
+              refresh()
+            }
+          })
+
+    const banForm = banning
+      ? (() => {
+          const form = el('form', { class: 'admin-edit-form ban-form' }, [
+            el('label', { class: 'field' }, [
+              el('span', { text: 'سبب الإيقاف عن النشر' }),
+              el('input', { name: 'reason', value: 'مخالفة قوانين المنتدى', maxlength: '200' })
+            ]),
+            el('div', { class: 'form-actions' }, [
+              el('button', { class: 'button danger small', type: 'submit', text: 'تأكيد الإيقاف' }),
+              el('button', {
+                class: 'button ghost small',
+                type: 'button',
+                text: 'إلغاء',
+                onclick: () => {
+                  adminUi.banId = null
+                  refresh()
+                }
+              })
+            ])
+          ])
+
+          form.addEventListener('submit', async event => {
+            event.preventDefault()
+            const data = new FormData(form)
+
+            const ok = await patch(
+              user.id,
+              { is_banned: true, banned_reason: data.get('reason') },
+              `تم إيقاف ${user.username} عن النشر`
+            )
+
+            if (ok) {
+              adminUi.banId = null
+              refresh()
+            }
+          })
+
+          return form
+        })()
+      : null
+
+    const editAction = el('button', {
+      class: 'button ghost small',
+      type: 'button',
+      text: editing ? 'إغلاق' : 'تعديل',
+      onclick: () => {
+        adminUi.editingId = editing ? null : user.id
+        adminUi.banId = null
+        refresh()
+      }
+    })
+
+    const deleteAction = isSelf
+      ? null
+      : el('button', {
+          class: 'button danger small',
+          type: 'button',
+          text: 'حذف',
+          onclick: async () => {
+            const summary = `سيُحذف ${user.topic_count} موضوع و${user.reply_count} رد — لا يمكن التراجع.`
+
+            if (!window.confirm(`حذف حساب ${user.username} نهائياً؟\n${summary}`)) return
+
+            try {
+              await api(`/api/admin/users/${user.id}`, { method: 'DELETE' })
+              toast(`تم حذف ${user.username}`)
+              adminUi.editingId = null
+              adminUi.banId = null
+              refresh()
+            } catch (error) {
+              toast(error.message, 'error')
+            }
+          }
+        })
+
+    const editForm = editing
+      ? (() => {
+          const form = el('form', { class: 'admin-edit-form' }, [
+            el('label', { class: 'field' }, [
+              el('span', { text: 'اسم المستخدم (إنجليزي)' }),
+              el('input', { name: 'username', value: user.username, maxlength: '24' })
+            ]),
+            el('label', { class: 'field' }, [
+              el('span', { text: 'البريد الإلكتروني' }),
+              el('input', { name: 'email', type: 'email', value: user.email, maxlength: '120' })
+            ]),
+            el('div', { class: 'form-actions' }, [
+              el('button', { class: 'button primary small', type: 'submit', text: 'حفظ' }),
+              el('button', {
+                class: 'button ghost small',
+                type: 'button',
+                text: 'إلغاء',
+                onclick: () => {
+                  adminUi.editingId = null
+                  refresh()
+                }
+              })
+            ])
+          ])
+
+          form.addEventListener('submit', async event => {
+            event.preventDefault()
+            const data = new FormData(form)
+
+            const ok = await patch(
+              user.id,
+              { username: data.get('username'), email: data.get('email') },
+              `تم تحديث بيانات ${user.username}`
+            )
+
+            if (ok) {
+              adminUi.editingId = null
+              refresh()
+            }
+          })
+
+          return form
+        })()
+      : null
+
+    return el('div', { class: `admin-row${user.is_banned ? ' banned' : ''}` }, [
+      el('div', { class: 'admin-row-head' }, [
+        el('span', { class: 'avatar', text: user.username.slice(0, 1).toUpperCase() }),
+        el('div', { class: 'admin-row-id' }, [
+          el('div', { class: 'admin-row-name' }, [
+            el('strong', { text: user.username }),
+            isSelf ? el('span', { class: 'chip self', text: 'أنت' }) : null,
+            roleChip,
+            statusChip
+          ].filter(Boolean)),
+          el('small', { class: 'muted', text: user.email }),
+          user.is_banned && user.banned_reason
+            ? el('small', { class: 'admin-ban-reason', text: `السبب: ${user.banned_reason}` })
+            : null
+        ].filter(Boolean)),
+        el('div', { class: 'admin-row-actions' }, [
+          roleAction,
+          banAction,
+          editAction,
+          deleteAction
+        ].filter(Boolean))
+      ]),
+      el('div', { class: 'admin-row-meta' }, [
+        el('span', { class: 'meta' }, [icon('comment', 14), el('span', { text: `${user.topic_count} موضوع` })]),
+        el('span', { class: 'meta' }, [icon('send', 14), el('span', { text: `${user.reply_count} رد` })]),
+        el('span', { class: 'meta' }, [icon('user', 14), el('span', { text: `منذ ${formatDate(user.created_at)}` })]),
+        user.banned_at
+          ? el('span', { class: 'meta' }, [icon('ban', 14), el('span', { text: `أُوقف ${timeAgo(user.banned_at)}` })])
+          : null
+      ].filter(Boolean)),
+      editForm,
+      banForm
+    ])
+  }
+
+  const searchForm = el('form', {
+    class: 'filter-search',
+    onsubmit: event => {
+      event.preventDefault()
+      setParam('q', String(new FormData(event.currentTarget).get('q') || '').trim())
+    }
+  }, [
+    icon('search', 16),
+    el('input', { name: 'q', type: 'search', value: params.q, placeholder: 'ابحث بالاسم أو البريد…' }),
+    el('button', { class: 'button primary small', type: 'submit', text: 'بحث' })
+  ])
+
+  const roleChips = el('div', { class: 'chip-row' }, [
+    el('button', {
+      class: `chip${params.role ? '' : ' active'}`,
+      type: 'button',
+      text: 'كل الأدوار',
+      onclick: () => setParam('role', '')
+    }),
+    el('button', {
+      class: `chip${params.role === 'admin' ? ' active' : ''}`,
+      type: 'button',
+      text: 'المديرون',
+      onclick: () => setParam('role', 'admin')
+    }),
+    el('button', {
+      class: `chip${params.role === 'member' ? ' active' : ''}`,
+      type: 'button',
+      text: 'الأعضاء',
+      onclick: () => setParam('role', 'member')
+    }),
+    el('span', { class: 'chip-divider', text: '•' }),
+    el('button', {
+      class: `chip${params.status === 'banned' ? ' active' : ''}`,
+      type: 'button',
+      text: 'الموقوفون',
+      onclick: () => setParam('status', params.status === 'banned' ? '' : 'banned')
+    }),
+    el('button', {
+      class: `chip${params.status === 'active' ? ' active' : ''}`,
+      type: 'button',
+      text: 'النشطون',
+      onclick: () => setParam('status', params.status === 'active' ? '' : 'active')
+    })
+  ])
+
+  const statsBlock = el('div', { class: 'admin-stats' }, [
+    statBlock(stats.members, 'عضو'),
+    statBlock(stats.admins, 'مدير'),
+    statBlock(stats.banned, 'موقوف'),
+    statBlock(stats.online, 'متصل الآن'),
+    statBlock(stats.topics, 'موضوع'),
+    statBlock(stats.replies, 'رد')
+  ])
+
+  const list = users.length
+    ? users.map(adminRow)
+    : [emptyState('لا يوجد حسابات مطابقة.')]
+
+  const pages = []
+  for (let page = 1; page <= pagination.pages; page += 1) {
+    if (pagination.pages > 7 && page > 2 && page < pagination.pages - 1 && Math.abs(page - pagination.page) > 1) {
+      if (pages[pages.length - 1] !== '…') pages.push('…')
+      continue
+    }
+    pages.push(page)
+  }
+
+  const paginationBar = pagination.pages > 1
+    ? el('div', { class: 'pagination' }, [
+        el('button', {
+          class: 'page-btn',
+          type: 'button',
+          text: 'السابق',
+          disabled: pagination.page <= 1,
+          onclick: () => setParam('page', pagination.page - 1)
+        }),
+        ...pages.map(page => page === '…'
+          ? el('span', { class: 'page-ellipsis', text: '…' })
+          : el('button', {
+              class: `page-btn${page === pagination.page ? ' active' : ''}`,
+              type: 'button',
+              text: String(page),
+              onclick: () => setParam('page', page)
+            })),
+        el('button', {
+          class: 'page-btn',
+          type: 'button',
+          text: 'التالي',
+          disabled: pagination.page >= pagination.pages,
+          onclick: () => setParam('page', pagination.page + 1)
+        }),
+        el('span', { class: 'pagination-meta', text: `${pagination.total} حساب` })
+      ])
+    : null
+
+  renderLayout(el('section', { class: 'panel page-panel admin-page' }, [
+    el('div', { class: 'section-heading' }, [
+      sectionHeading('CONTROL ROOM', 'لوحة التحكم'),
+      el('button', {
+        class: 'button ghost small',
+        type: 'button',
+        text: 'تحديث',
+        onclick: refresh
+      })
+    ]),
+    statsBlock,
+    el('div', { class: 'filters' }, [searchForm]),
+    roleChips,
+    el('div', { class: 'admin-list' }, list),
+    paginationBar
+  ].filter(Boolean)))
+}
+
 async function logout() {
   try {
     await api('/api/auth/logout', { method: 'POST' })
@@ -1160,6 +1557,7 @@ async function render() {
     else if (head === 'login') authView('login')
     else if (head === 'register') authView('register')
     else if (head === 'notifications') await viewNotifications()
+    else if (head === 'admin') await viewAdmin(route.query)
     else if (head === 'bookmarks') await viewBookmarks()
     else if (head === 'profile') await viewProfile()
     else if (head === 'user' && param) await viewProfile(Number(param))

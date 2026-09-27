@@ -21,6 +21,13 @@
 - إشعارات: متابعة، رد، إعجاب
 - عدّاد مشاهادات ( مرة واحدة لكل زائر كل 24 ساعة)
 
+**لوحة تحكم المدير** (`#/admin`)
+- تظهر في القائمة لل admins فقط، وأي مستخدم آخر يفتح الرابط يشوف «غير مخوّل» (403)
+- إحصائيات المنصة + بحث بالاسم/البريد + فلترة بالأدوار والحالة + ترقيم صفحات
+- ترقية/تخفيض، تعديل الاسم والبريد، حذف الحساب (مع محتواه)، إيقاف عن النشر ورفع الإيقاف
+- الإيقاف = منع النشر فقط (يقدر يتصفح)، ويُمسح جلسات المستخدم فوراً
+- ضمانات: لا يحذف أدمن حسابه، ولا يُخفَّض/يُحذف آخر مدير
+
 **الخادم**
 - Express 5 + better-sqlite3 (WAL) مع ترحيل تلقائي للـ schema عند الإقلاع
 - حماية: عناوين أمان، تحديد محاولات الدخول (rate limit)، حجم جسم الطلب، جلسات `httpOnly`
@@ -49,19 +56,52 @@ npm start
 | `ALLOWED_ORIGINS` | مصادر CORS مفصولة بفواصل (إن كان الواجهة على نطاق آخر) | فارغ (نفس النطاق) |
 | `TRUST_PROXY` | `1` عند العمل خلف بروكسي/نفق | غير مفعّل |
 
+## النشر (Cloudflare Workers + D1)
+
+الموقع منشور على: **https://iraq-dark.laethking131.workers.dev**
+
+الـ Worker في `worker/index.mjs` هو نفسه الـ API، لكن مربوط بـ D1 بدل SQLite المحلي:
+
+| | محلي | منشور |
+| --- | --- | --- |
+| الخادم | Express 5 (`server/server.cjs`) | Worker مصغّر (`worker/app.mjs`) |
+| القاعدة | better-sqlite3 (`data/`) | Cloudflare D1 |
+| تشفير كلمة المرور | bcrypt | PBKDF2-SHA256 (Web Crypto) |
+| تنظيف الجلسات | `setInterval` | cron كل 6 ساعات |
+
+```bash
+# تصدير القاعدة المحلية إلى SQL (كلمة مرور الحسابات القديمة تُعاد ضبطها)
+MIGRATE_PASSWORD='<8+ أحرف>' npm run db:export
+npm run deploy:d1      # ترحيل SQL إلى D1
+
+npm run dev:worker     # تجربة محلياً على :8787
+npm run deploy         # بناء + نشر
+```
+
+> كلمة المرور لا يمكن ترحيلها من bcrypt إلى PBKDF2، لذا تُضبط الحسابات القديمة على
+> كلمة المرور الممرّرة في `MIGRATE_PASSWORD`.
+
 ## بنية المشروع
 
 ```
 ├── index.html            # نقطة الدخول (RTL, ar)
 ├── vite.config.js        # إعداد Vite + proxy للـ API
+├── wrangler.toml         # إعداد Cloudflare Worker + D1
 ├── src/
 │   ├── main.js           # التطبيق كله: router + views + api
 │   └── style.css         # نظام التصميم الداكن
+├── worker/               # نسخة Worker للنشر (D1 + Web Crypto)
+│   ├── index.mjs         # نقطة الدخول: /api + الأصول + cron
+│   └── app.mjs           # الراوتر + المسارات
 ├── server/
-│   ├── server.cjs        # API + تقديم dist
+│   ├── server.cjs        # API + تقديم dist (محلي)
 │   ├── start.cjs         # نقطة تشغيل الإنتاج
+│   ├── set-role.cjs      # تغيير دور مستخدم (npm run db:admin)
 │   ├── init-db.cjs       # تهيئة القاعدة
 │   └── upgrade-db.cjs    # جداول الميزات المتقدمة
+├── scripts/
+│   ├── export-d1.mjs     # تصدير SQLite -> SQL لـ D1
+│   └── cleanup-dev.sql   # تنظيف حسابات الاختبار
 └── data/                 # قاعدة البيانات (غير مرفوعة للـ git)
 ```
 

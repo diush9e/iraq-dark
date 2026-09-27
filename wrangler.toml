@@ -1,0 +1,18 @@
+name = "iraq-dark"
+main = "worker/index.mjs"
+compatibility_date = "2026-08-01"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "iraq-dark-db"
+database_id = "02a3d52d-e936-468a-8847-7baf7d1bc7af"
+
+[triggers]
+crons = ["0 */6 * * *"]
+
+[observability]
+enabled = true
