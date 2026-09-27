@@ -593,84 +593,6 @@ hr {
   letter-spacing: 0.42em;
 }
 
-/* Flag art in hero */
-
-.iraq-flag {
-  position: absolute;
-  top: 44px;
-  inset-inline-end: 3%;
-  z-index: 0;
-  display: flex;
-  align-items: flex-start;
-  opacity: 0.3;
-  pointer-events: none;
-  transform: rotate(-4deg) scale(0.85);
-  transform-origin: top right;
-}
-
-.flag-pole {
-  width: 3px;
-  height: 210px;
-  background: linear-gradient(#8d806c, #332f2a);
-  box-shadow: 0 0 8px rgba(201, 166, 107, 0.25);
-}
-
-.flag-cloth {
-  position: relative;
-  width: 220px;
-  height: 132px;
-  overflow: hidden;
-  transform-origin: left center;
-  background: linear-gradient(
-    to bottom,
-    #8b2928 0 33.33%,
-    #e7e1d5 33.33% 66.66%,
-    #171718 66.66% 100%
-  );
-  box-shadow: 0 14px 28px rgba(0, 0, 0, 0.34);
-  animation: iraqFlagWave 3.8s ease-in-out infinite;
-}
-
-.flag-cloth::after {
-  position: absolute;
-  inset: 0;
-  content: "";
-  background: linear-gradient(
-    90deg,
-    rgba(0, 0, 0, 0.34),
-    transparent 22%,
-    rgba(255, 255, 255, 0.11) 48%,
-    transparent 74%,
-    rgba(0, 0, 0, 0.28)
-  );
-  mix-blend-mode: overlay;
-}
-
-.flag-cloth span {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  display: grid;
-  place-items: center;
-  color: var(--green);
-  font-size: 1rem;
-  font-weight: 800;
-  white-space: nowrap;
-}
-
-@keyframes iraqFlagWave {
-  0%,
-  100% {
-    border-radius: 1px 0 2px 1px;
-    transform: perspective(500px) rotateY(0deg) skewY(0deg);
-  }
-
-  50% {
-    border-radius: 1px 3px 4px 1px;
-    transform: perspective(500px) rotateY(-13deg) skewY(2deg);
-  }
-}
-
 /* --------------------------------------------------------------------------
    Sections & cards
    -------------------------------------------------------------------------- */
@@ -1604,11 +1526,6 @@ textarea::placeholder {
 
   .hero-art {
     aspect-ratio: 16 / 7;
-  }
-
-  /* Single column hero — the flag would collide with the headline. */
-  .iraq-flag {
-    display: none;
   }
 }
 

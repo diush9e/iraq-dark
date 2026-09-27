@@ -579,13 +579,6 @@ function closeMenu() {
    Shared pieces
    -------------------------------------------------------------------------- */
 
-function flagArt() {
-  return el('div', { class: 'iraq-flag', 'aria-label': 'علم العراق', role: 'img' }, [
-    el('div', { class: 'flag-pole' }),
-    el('div', { class: 'flag-cloth' }, [el('span', { text: 'الله أكبر' })])
-  ])
-}
-
 function statBlock(value, label) {
   return el('div', { class: 'stat' }, [
     el('strong', { text: String(value ?? 0) }),
@@ -653,7 +646,6 @@ async function viewHome() {
   ])
 
   const hero = el('section', { class: 'hero' }, [
-    flagArt(),
     el('div', { class: 'hero-copy' }, [
       el('p', { class: 'eyebrow', text: 'IRAQ DARK / 2026' }),
       el('h1', { text: 'حيث تلتقي الظلال، وتولد الأفكار، وتصوت الأصوات.' }),
